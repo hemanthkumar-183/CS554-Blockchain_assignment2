@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract CoinToss {
+    enum Phase { Idle, Commit, Reveal, Complete }
+
+    struct Player {
+        bytes32 commitment;
+        bool committed;
+        bool revealed;
+        uint8 choice;
+    }
+
+    address public referee;
+    address public indiaCaptain;
+    address public englandCaptain;
+    uint256 public stake;
+    uint64 public commitDeadline;
+    uint64 public revealDeadline;
+    uint64 public commitDuration;
+    uint64 public revealDuration;
+    Phase public phase;
+    uint256 public roundId;
+    address public winner;
+    uint8 public outcome;
+    mapping(address => Player) private players;
+    mapping(address => uint256) public pendingWithdrawals;
+    bool private locked;
+
+    event RoundStarted(uint256 roundId, address india, address england, uint256 stake, uint64 commitWindow, uint64 revealWindow);
+    event Committed(address indexed player, bytes32 commitment);
+    event RevealOpened(uint64 revealDeadline);
+    event Revealed(address indexed player, uint8 choice);
+    event WinnerDeclared(uint256 roundId, address indexed winner, uint8 outcome);
+    event Refunded(address indexed player, uint256 amount);
+    event Withdrawn(address indexed player, uint256 amount);
+    event PhaseChanged(Phase phase);
+
+    modifier onlyReferee() {
+        require(msg.sender == referee, "Not referee");
+        _;
+    }
+
+    modifier onlyCaptain() {
+        require(msg.sender == indiaCaptain || msg.sender == englandCaptain, "Not a captain");
+        _;
+    }
+
+    modifier nonReentrant() {
+        require(!locked, "Reentrancy");
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    constructor(address _referee) {
+        require(_referee != address(0), "Zero referee");
+        referee = _referee;
+        phase = Phase.Idle;
+    }
+
+    function startRound(
+        address _india,
+        address _england,
+        uint64 _commitDuration,
+        uint64 _revealDuration,
+        uint256 _stakeWei
+    ) external onlyReferee {
+        require(phase == Phase.Idle || phase == Phase.Complete, "Round active");
+        require(_india != address(0) && _england != address(0), "Zero captain");
+        require(_india != _england, "Distinct captains");
+        require(_commitDuration > 0 && _revealDuration > 0, "Bad windows");
+        delete players[_india];
+        delete players[_england];
+        indiaCaptain = _india;
+        englandCaptain = _england;
+        commitDuration = _commitDuration;
+        revealDuration = _revealDuration;
+        stake = _stakeWei;
+        winner = address(0);
+        outcome = 0;
+        ++roundId;
+        phase = Phase.Commit;
+        commitDeadline = uint64(block.timestamp) + _commitDuration;
+        revealDeadline = 0;
+        emit RoundStarted(roundId, _india, _england, _stakeWei, _commitDuration, _revealDuration);
+        emit PhaseChanged(phase);
+    }
+
+    function calcCommitment(address who, uint8 choice, bytes32 salt) public view returns (bytes32) {
+        require(choice == 0 || choice == 1, "choice must be 0/1");
+        return keccak256(abi.encodePacked(who, choice, salt, address(this), roundId));
+    }
+
+    function commit(bytes32 commitment) external payable onlyCaptain {
+        require(phase == Phase.Commit, "Not commit phase");
+        require(block.timestamp <= commitDeadline, "Commit window over");
+        Player storage p = players[msg.sender];
+        require(!p.committed, "Already committed");
+        if (stake > 0) {
+            require(msg.value == stake, "Bad stake");
+        } else {
+            require(msg.value == 0, "No stake needed");
+        }
+        p.commitment = commitment;
+        p.committed = true;
+        emit Committed(msg.sender, commitment);
+        if (players[indiaCaptain].committed && players[englandCaptain].committed) {
+            phase = Phase.Reveal;
+            revealDeadline = uint64(block.timestamp) + revealDuration;
+            emit RevealOpened(revealDeadline);
+            emit PhaseChanged(phase);
+        }
+    }
+
+    function reveal(uint8 choice, bytes32 salt) external onlyCaptain {
+        require(phase == Phase.Reveal, "Not reveal phase");
+        require(block.timestamp <= revealDeadline, "Reveal window over");
+        require(choice == 0 || choice == 1, "choice must be 0/1");
+        Player storage p = players[msg.sender];
+        require(p.committed, "Not committed");
+        require(!p.revealed, "Already revealed");
+        bytes32 expected = calcCommitment(msg.sender, choice, salt);
+        require(expected == p.commitment, "Commitment mismatch");
+        p.choice = choice;
+        p.revealed = true;
+        emit Revealed(msg.sender, choice);
+        if (players[indiaCaptain].revealed && players[englandCaptain].revealed) {
+            _finalizeOnBothReveal();
+        }
+    }
+
+    function claimTimeoutWin() external {
+        require(phase == Phase.Reveal, "Not reveal phase");
+        require(block.timestamp > revealDeadline, "Too early");
+        bool indiaRevealed = players[indiaCaptain].revealed;
+        bool englandRevealed = players[englandCaptain].revealed;
+        require(indiaRevealed != englandRevealed, "Both or none revealed");
+        address revealer = indiaRevealed ? indiaCaptain : englandCaptain;
+        _declareWinnerTimeout(revealer);
+    }
+
+    function refundUnmatchedCommit() external {
+        require(phase == Phase.Commit, "Not commit phase");
+        require(block.timestamp > commitDeadline, "Too early");
+        bool indiaCommitted = players[indiaCaptain].committed;
+        bool englandCommitted = players[englandCaptain].committed;
+        require(indiaCommitted != englandCommitted, "Both or none committed");
+        address committedAddr = indiaCommitted ? indiaCaptain : englandCaptain;
+        require(msg.sender == committedAddr, "Not committer");
+        if (stake > 0) {
+            pendingWithdrawals[committedAddr] += stake;
+            emit Refunded(committedAddr, stake);
+        }
+        phase = Phase.Complete;
+        emit PhaseChanged(phase);
+    }
+
+    function withdraw() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "Nothing to withdraw");
+        pendingWithdrawals[msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Withdraw failed");
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    function _finalizeOnBothReveal() private {
+        require(phase == Phase.Reveal, "Phase");
+        uint8 i = players[indiaCaptain].choice;
+        uint8 e = players[englandCaptain].choice;
+        outcome = i ^ e;
+        winner = (outcome == 0) ? indiaCaptain : englandCaptain;
+        if (stake > 0) {
+            pendingWithdrawals[indiaCaptain] += stake;
+            pendingWithdrawals[englandCaptain] += stake;
+        }
+        phase = Phase.Complete;
+        emit WinnerDeclared(roundId, winner, outcome);
+        emit PhaseChanged(phase);
+    }
+
+    function _declareWinnerTimeout(address revealer) private {
+        winner = revealer;
+        outcome = (revealer == indiaCaptain) ? 0 : 1;
+        if (stake > 0) {
+            pendingWithdrawals[revealer] += (stake * 2);
+        }
+        phase = Phase.Complete;
+        emit WinnerDeclared(roundId, winner, outcome);
+        emit PhaseChanged(phase);
+    }
+
+    function getPlayer(address who) external view returns (bool committed, bool revealed, bytes32 commitment, uint8 choice) {
+        Player storage p = players[who];
+        return (p.committed, p.revealed, p.commitment, p.choice);
+    }
+}
